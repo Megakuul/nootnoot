@@ -5,10 +5,11 @@ export class Webcam {
   /**
    * Open webcam and stream it through video tag.
    * @param {HTMLVideoElement} videoRef video tag reference
+   * @returns {Promise} Promise that resolves when camera is opened
    */
   open = (videoRef) => {
     if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-      navigator.mediaDevices
+      return navigator.mediaDevices
         .getUserMedia({
           audio: false,
           video: {
@@ -17,8 +18,15 @@ export class Webcam {
         })
         .then((stream) => {
           videoRef.srcObject = stream;
+          return stream;
+        })
+        .catch((error) => {
+          console.error("Failed to access webcam:", error);
+          throw new Error("Can't open Webcam! " + error.message);
         });
-    } else alert("Can't open Webcam!");
+    } else {
+      return Promise.reject(new Error("MediaDevices API not supported!"));
+    }
   };
 
   /**
@@ -26,11 +34,11 @@ export class Webcam {
    * @param {HTMLVideoElement} videoRef video tag reference
    */
   close = (videoRef) => {
-    if (videoRef.srcObject) {
+    if (videoRef.srcObject && videoRef.srcObject instanceof MediaStream) {
       videoRef.srcObject.getTracks().forEach((track) => {
         track.stop();
       });
       videoRef.srcObject = null;
-    } else alert("Please open Webcam first!");
+    }
   };
 }

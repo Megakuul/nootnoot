@@ -34,7 +34,7 @@ const preprocess = (source, modelWidth, modelHeight) => {
   return [input, xRatio, yRatio];
 };
 
-const detectFrame = async (source, model, canvas, useMask, callback = () => {}) => {
+const detectFrame = async (source, model, canvas, useMask, callback = () => {}, onDetection = () => {}) => {
   const [modelHeight, modelWidth] = model.inputShape.slice(1, 3); // get model width and height
   const [modelSegHeight, modelSegWidth, modelSegChannel] = model.outputShape[1].slice(1);
 
@@ -44,7 +44,11 @@ const detectFrame = async (source, model, canvas, useMask, callback = () => {}) 
 
   const res = model.net.execute(input);
   const transRes = tf.tidy(() => res[0].transpose([0, 2, 1]).squeeze()); // transpose main result
-  const transSegMask = tf.tidy(() => res[1].transpose([0, 3, 1, 2]).squeeze()); // transpose segmentation mask result
+  // Only compute segmentation mask transformation if masks are enabled
+  let transSegMask;
+  if (useMask) {
+    transSegMask = tf.tidy(() => res[1].transpose([0, 3, 1, 2]).squeeze()); // transpose segmentation mask result
+  }
 
   const boxes = tf.tidy(() => {
     const w = transRes.slice([0, 2], [-1, 1]);
@@ -69,7 +73,7 @@ const detectFrame = async (source, model, canvas, useMask, callback = () => {}) 
     return [rawScores.max(1), rawScores.argMax(1)];
   }); // get scores and classes
 
-  const nms = await tf.image.nonMaxSuppressionAsync(boxes, scores, 500, 0.45, 0.2); // do nms to filter boxes
+  const nms = await tf.image.nonMaxSuppressionAsync(boxes, scores, 500, 0.45, 0.2); // match previous behavior
   const detReady = tf.tidy(() =>
     tf.concat(
       [
@@ -81,23 +85,32 @@ const detectFrame = async (source, model, canvas, useMask, callback = () => {}) 
     )
   ); // indexing selected boxes, scores and classes from NMS result
   let masks = [];  
-  if (useMask) {
+  if (useMask && transSegMask) {
     masks = tf.tidy(() => {
       const sliced = transRes.slice([0, 4 + numClass], [-1, modelSegChannel]).squeeze(); // slice mask from every detection [m, mask_size]
       return sliced
         .gather(nms, 0) // get selected mask from NMS result
-        .matMul(transSegMask.reshape([modelSegChannel, -1])) // matmul mask with segmentation mask result [n, mask_size] x [mask_size, h x w] => [n, h x w]
+  .matMul(transSegMask.reshape([modelSegChannel, -1])) // matmul mask with segmentation mask result [n, mask_size] x [mask_size, h x w] => [n, h x w]
         .reshape([nms.shape[0], modelSegHeight, modelSegWidth]); // reshape back [n, h x w] => [n, h, w]
     });
   }
 
   const toDraw = [];
-  let overlay = tf.zeros([modelHeight, modelWidth, 4]); // initialize overlay to draw mask
+  let overlay = null;
+  if (useMask) {
+    overlay = tf.zeros([modelHeight, modelWidth, 4]); // initialize overlay to draw mask
+  }
 
   for (let i = 0; i < detReady.shape[0]; i++) {
     const rowData = detReady.slice([i, 0], [1, 6]); // get every first 6 element from every row
     let [y1, x1, y2, x2, score, label] = rowData.dataSync(); // [y1, x1, y2, x2, score, label]
     const color = colors.get(label); // get label color
+    const frameBox = [
+      Math.floor(y1), // y in 640x640 model space
+      Math.floor(x1), // x in 640x640 model space
+      Math.round(y2 - y1), // h
+      Math.round(x2 - x1), // w
+    ];
 
     const downSampleBox = [
       Math.floor((y1 * modelSegHeight) / modelHeight), // y
@@ -112,7 +125,7 @@ const detectFrame = async (source, model, canvas, useMask, callback = () => {}) 
       Math.round((x2 - x1) * xRatio), // w
     ]; // upsampled box (box ratio to draw)
 
-   if (useMask) {
+  if (useMask && overlay) {
     const proto = tf.tidy(() => {
       const sliced = masks.slice(
         [
@@ -148,6 +161,7 @@ const detectFrame = async (source, model, canvas, useMask, callback = () => {}) 
     });
     toDraw.push({
       box: upSampleBox,
+      frameBox,
       score: score,
       klass: label,
       label: labels[label],
@@ -157,6 +171,7 @@ const detectFrame = async (source, model, canvas, useMask, callback = () => {}) 
    } else {
     toDraw.push({
       box: upSampleBox,
+      frameBox,
       score: score,
       klass: label,
       label: labels[label],
@@ -167,25 +182,37 @@ const detectFrame = async (source, model, canvas, useMask, callback = () => {}) 
    }
   }
 
-  const maskImg = new ImageData(
-    new Uint8ClampedArray(await overlay.data()), // tensor to array
-    modelHeight,
-    modelWidth
-  ); // create image data from mask overlay
-
   const ctx = canvas.getContext("2d");
   ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height); // clean canvas
-  ctx.putImageData(maskImg, 0, 0); // render overlay to canvas
+  if (useMask && overlay) {
+    const maskImg = new ImageData(
+      new Uint8ClampedArray(await overlay.data()), // tensor to array
+      modelHeight,
+      modelWidth
+    ); // create image data from mask overlay
+    ctx.putImageData(maskImg, 0, 0); // render overlay to canvas
+  }
 
   renderBoxes(ctx, toDraw); // render boxes
   renderMapIcons(toDraw);
+
+  // Send detection results to callback
+  const detectionResults = toDraw.map(item => ({
+    class: item.label,
+    score: item.score,
+    box: item.frameBox, // 640x640 model space for downstream math/cropping
+    frameBox: item.frameBox,
+    drawBox: item.box,   // canvas pixel space
+    klass: item.klass
+  }));
+  onDetection(detectionResults);
 
   callback(); // run callback function
 
   tf.engine().endScope(); // end of scoping
 };
 
-export const detectVideo = (vidSource, model, canvas, useMask) => {
+export const detectVideo = (vidSource, model, canvas, useMask, onDetection = () => {}) => {
   /**
    * Function to detect every frame from video
    */
@@ -198,7 +225,7 @@ export const detectVideo = (vidSource, model, canvas, useMask) => {
 
     detectFrame(vidSource, model, canvas, useMask, () => {
       requestAnimationFrame(detect); // get another frame
-    });
+    }, onDetection);
   };
 
   detect(); // initialize to detect every frame
